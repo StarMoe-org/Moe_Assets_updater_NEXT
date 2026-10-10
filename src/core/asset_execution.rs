@@ -1235,9 +1235,44 @@ impl AssetExecutionContext {
     }
 
     async fn fetch_asset_bundle_info(&mut self) -> Result<AssetBundleInfo, AssetExecutionError> {
+        self.ensure_nuverse_app_version().await?;
         let url = self.render_asset_info_url().await?;
+        tracing::info!(
+            region = %self.region_name,
+            app_version = ?self.resolved_app_version,
+            asset_version = ?self.resolved_asset_version,
+            url = %url,
+            "fetching asset bundle info"
+        );
         let body = self.get_with_retry(&url).await?;
         self.decrypt_region_msgpack(&body)
+    }
+
+    /// Nuverse CDN paths are keyed by app version, so every path that fetches
+    /// asset info must resolve it from `current_version_url` first. The
+    /// configured `app_version` is only a fallback when that URL is unset.
+    async fn ensure_nuverse_app_version(&mut self) -> Result<(), AssetExecutionError> {
+        let configured = match &self.region.provider {
+            RegionProviderConfig::Nuverse { app_version, .. } => app_version.clone(),
+            RegionProviderConfig::ColorfulPalette { .. } => return Ok(()),
+        };
+        if self.resolved_app_version.is_some() {
+            return Ok(());
+        }
+        self.resolve_provider_versions().await?;
+        if let Some(resolved) = self
+            .resolved_app_version
+            .as_deref()
+            .filter(|resolved| *resolved != configured)
+        {
+            tracing::warn!(
+                region = %self.region_name,
+                configured_app_version = %configured,
+                resolved_app_version = %resolved,
+                "configured nuverse app_version is stale; using version from current_version_url"
+            );
+        }
+        Ok(())
     }
 
     async fn resolve_provider_versions(&mut self) -> Result<(), AssetExecutionError> {
@@ -2997,6 +3032,154 @@ mod tests {
         assert_eq!(summary.completed_downloads, 1);
         assert_eq!(version_hits.load(Ordering::SeqCst), 1);
         assert!(cookie_seen.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn nuverse_prefers_current_version_app_version_over_config() {
+        let temp = tempdir().unwrap();
+        let record_file = temp.path().join("downloaded_assets.json");
+        let save_dir = temp.path().join("exports");
+
+        let info = AssetBundleInfo {
+            version: Some("1".to_string()),
+            os: Some("ios".to_string()),
+            bundles: HashMap::from([(
+                "ond/a".to_string(),
+                AssetBundleDetail {
+                    bundle_name: "ond/a".to_string(),
+                    cache_file_name: "a".to_string(),
+                    cache_directory_name: "d".to_string(),
+                    hash: "hash-a".to_string(),
+                    category: AssetCategory::OnDemand,
+                    crc: 888,
+                    file_size: 1,
+                    dependencies: Vec::new(),
+                    paths: Vec::new(),
+                    is_builtin: false,
+                    is_relocate: None,
+                    md5_hash: None,
+                    download_path: Some("ios13".to_string()),
+                },
+            )]),
+        };
+        let encrypted = encrypt_asset_info(&info);
+        let stale_hits = Arc::new(AtomicUsize::new(0));
+
+        // Only the 6.4.0 tree is served; any request built from the stale
+        // configured 6.0.0 lands on the fallback and is counted.
+        let app = Router::new()
+            .route(
+                "/current_version.json",
+                get(|| async { r#"{"appVersion":"6.4.0","assetVersion":"6.4.0.1"}"# }),
+            )
+            .route("/version/6.4.0", get(|| async { "13" }))
+            .route(
+                "/info/6.4.0/13",
+                get({
+                    let encrypted = encrypted.clone();
+                    move || async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            encrypted.clone(),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/bundle/6.4.0/ios13/ond/a",
+                get(|| async {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                        Body::from(vec![0x20, 0x00, 0x00, 0x00, b'B', b'U', b'N']),
+                    )
+                }),
+            )
+            .fallback({
+                let stale_hits = stale_hits.clone();
+                move || {
+                    let stale_hits = stale_hits.clone();
+                    async move {
+                        stale_hits.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::NOT_FOUND
+                    }
+                }
+            });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let region = RegionConfig {
+            enabled: true,
+            provider: RegionProviderConfig::Nuverse {
+                current_version_url: Some(format!("http://{addr}/current_version.json")),
+                asset_version_url: format!("http://{addr}/version/{{app_version}}"),
+                app_version: "6.0.0".to_string(),
+                asset_info_url_template: format!(
+                    "http://{addr}/info/{{app_version}}/{{asset_version}}"
+                ),
+                asset_bundle_url_template: format!(
+                    "http://{addr}/bundle/{{app_version}}/{{bundle_path}}"
+                ),
+                required_cookies: false,
+                cookie_bootstrap_url: None,
+            },
+            crypto: crate::core::config::CryptoConfig {
+                aes_key_hex: Some(TEST_AES_KEY_HEX.to_string()),
+                aes_iv_hex: Some(TEST_AES_IV_HEX.to_string()),
+            },
+            runtime: RegionRuntimeConfig {
+                unity_version: "2022.3.21f1".to_string(),
+            },
+            paths: RegionPathsConfig {
+                asset_save_dir: Some(save_dir.to_string_lossy().into_owned()),
+                downloaded_asset_record_file: Some(record_file.to_string_lossy().into_owned()),
+            },
+            filters: crate::core::config::RegionFiltersConfig {
+                start_app: Vec::new(),
+                on_demand: vec!["^ond/".to_string()],
+                skip: Vec::new(),
+                priority: vec!["^ond/".to_string()],
+            },
+            export: crate::core::config::RegionExportConfig {
+                raw_bundles: Some(RawBundleExportConfig {
+                    output_dir: None,
+                    include: vec!["^ond/".to_string()],
+                    exclude: Vec::new(),
+                }),
+                ..crate::core::config::RegionExportConfig::default()
+            },
+            ..RegionConfig::default()
+        };
+
+        let mut regions = BTreeMap::new();
+        regions.insert("cn".to_string(), region.clone());
+        let config = AppConfig {
+            regions,
+            concurrency: crate::core::config::ConcurrencyConfig {
+                download: 2,
+                ..crate::core::config::ConcurrencyConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let request = AssetUpdateRequest {
+            region: "cn".to_string(),
+            asset_version: None,
+            asset_hash: None,
+            dry_run: false,
+            mode: AssetUpdateMode::PrefetchRawBundles,
+        };
+
+        let executor = AssetExecutionContext::new(&config, "cn", &region, &request).unwrap();
+        let summary = executor
+            .prefetch_asset_bundles(&config, None, None)
+            .await
+            .unwrap();
+        assert_eq!(summary.discovered_bundles, 1);
+        assert_eq!(summary.completed_downloads, 1);
+        assert_eq!(stale_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

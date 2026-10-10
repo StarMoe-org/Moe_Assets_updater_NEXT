@@ -287,6 +287,7 @@ regions:
       kind: nuverse
       current_version_url: "https://raw.githubusercontent.com/Team-Haruki/haruki-sekai-sc-master/main/versions/current_version.json"
       asset_version_url: "https://lf3-mkcncdn-tos.dailygn.com/obj/rt-game-lf/gdl_app_5236/Mainland/{app_version}/Release/cn_online/ios/version"
+      # Fallback only: when current_version_url is set, its appVersion wins.
       app_version: "5.2.0"
       asset_info_url_template: "https://lf3-mkcncdn-tos.dailygn.com/obj/sf-game-lf/gdl_app_5236/AssetBundle/{app_version}/Release/cn_online/ios{asset_version}/AssetBundleInfoNew.json"
       asset_bundle_url_template: "https://lf3-mkcncdn-tos.dailygn.com/obj/sf-game-lf/gdl_app_5236/AssetBundle/{app_version}/Release/cn_online/{bundle_path}"
