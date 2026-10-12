@@ -197,6 +197,12 @@ pub struct DownloadTask {
 /// Used by the poller to run HIP `CHECK_BATCH` against the gateway and drop
 /// tasks whose bundle_hash the server has already seen.
 pub trait PreDownloadTaskFilter: Send {
+    /// A server-authoritative filter must see every candidate, even when a
+    /// previous local export wrote a download record before its upload failed.
+    fn is_server_authoritative(&self) -> bool {
+        false
+    }
+
     fn filter(
         self,
         tasks: Vec<DownloadTask>,
@@ -423,6 +429,9 @@ impl AssetExecutionContext {
         F: PreDownloadTaskFilter,
     {
         self.ensure_not_cancelled(&cancel_flag)?;
+        let persist_download_record = !pre_download_filter
+            .as_ref()
+            .is_some_and(PreDownloadTaskFilter::is_server_authoritative);
         let record_path = self
             .region
             .paths
@@ -431,7 +440,11 @@ impl AssetExecutionContext {
             .ok_or_else(|| AssetExecutionError::MissingAssetSaveDir {
                 region: self.region_name.clone(),
             })?;
-        let mut downloaded_assets = load_download_record(&record_path)?;
+        let mut downloaded_assets = if persist_download_record {
+            load_download_record(&record_path)?
+        } else {
+            DownloadRecord::new()
+        };
 
         Self::send_progress(
             &progress,
@@ -672,6 +685,7 @@ impl AssetExecutionContext {
                                 &mut completed,
                                 &mut pending_save_count,
                                 batch_save_size,
+                                persist_download_record,
                                 &self.region_name,
                                 bundle_path,
                                 bundle_hash,
@@ -702,25 +716,27 @@ impl AssetExecutionContext {
             }
         }
 
-        Self::send_progress(
-            &progress,
-            ExecutionProgressUpdate::Phase {
-                phase: JobPhase::PersistingState,
-                message: "saving downloaded asset record".to_string(),
-            },
-        );
         self.ensure_not_cancelled(&cancel_flag)?;
-        Self::save_download_record_on_blocking_thread(
-            record_path.clone(),
-            downloaded_assets.clone(),
-        )
-        .await?;
-        Self::send_progress(
-            &progress,
-            ExecutionProgressUpdate::RecordSaved {
-                entries: downloaded_assets.len(),
-            },
-        );
+        if persist_download_record {
+            Self::send_progress(
+                &progress,
+                ExecutionProgressUpdate::Phase {
+                    phase: JobPhase::PersistingState,
+                    message: "saving downloaded asset record".to_string(),
+                },
+            );
+            Self::save_download_record_on_blocking_thread(
+                record_path.clone(),
+                downloaded_assets.clone(),
+            )
+            .await?;
+            Self::send_progress(
+                &progress,
+                ExecutionProgressUpdate::RecordSaved {
+                    entries: downloaded_assets.len(),
+                },
+            );
+        }
         Self::send_progress(
             &progress,
             ExecutionProgressUpdate::Phase {
@@ -749,7 +765,11 @@ impl AssetExecutionContext {
             queued_downloads: queued_download_count,
             completed_downloads: completed,
             failed_downloads: failed,
-            updated_record_entries: downloaded_assets.len(),
+            updated_record_entries: if persist_download_record {
+                downloaded_assets.len()
+            } else {
+                0
+            },
             chart_hash_sync_performed,
         })
     }
@@ -1012,13 +1032,13 @@ impl AssetExecutionContext {
         completed: &mut usize,
         pending_save_count: &mut usize,
         batch_save_size: usize,
+        persist_download_record: bool,
         region_name: &str,
         bundle_path: String,
         bundle_hash: String,
     ) {
         *completed += 1;
         downloaded_assets.insert(bundle_path.clone(), bundle_hash);
-        *pending_save_count += 1;
         if progress.is_none() {
             tracing::info!(
                 region = %region_name,
@@ -1033,6 +1053,12 @@ impl AssetExecutionContext {
                 bundle: bundle_path,
             },
         );
+        // The in-memory map still feeds chart-hash sync; it is not evidence
+        // that HIP has committed the export, and must not become a disk skip.
+        if !persist_download_record {
+            return;
+        }
+        *pending_save_count += 1;
         if batch_save_size > 0 && *pending_save_count >= batch_save_size {
             tracing::info!(
                 region = %region_name,
@@ -2411,6 +2437,171 @@ mod tests {
     type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
     const TEST_AES_KEY_HEX: &str = "00112233445566778899aabbccddeeff";
     const TEST_AES_IV_HEX: &str = "0102030405060708090a0b0c0d0e0f10";
+
+    struct ObservePlanning {
+        authoritative: bool,
+        observed: Arc<AtomicUsize>,
+    }
+
+    impl super::PreDownloadTaskFilter for ObservePlanning {
+        fn is_server_authoritative(&self) -> bool {
+            self.authoritative
+        }
+
+        fn filter(
+            self,
+            tasks: Vec<super::DownloadTask>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<super::DownloadTask>,
+                            crate::core::errors::AssetExecutionError,
+                        >,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async move {
+                self.observed.store(tasks.len(), Ordering::SeqCst);
+                // Stop before real bundle download/export. This tests the actual
+                // executor planning path with an encrypted HTTP AssetBundleInfo.
+                Err(crate::core::errors::AssetExecutionError::Cancelled)
+            })
+        }
+    }
+
+    async fn observed_planning_tasks(authoritative: bool, record: &[u8]) -> usize {
+        let temp = tempdir().unwrap();
+        let record_file = temp.path().join("downloaded_assets.json");
+        std::fs::write(&record_file, record).unwrap();
+        let info = AssetBundleInfo {
+            version: Some("1".into()),
+            os: Some("ios".into()),
+            bundles: HashMap::from([(
+                "start/a".into(),
+                AssetBundleDetail {
+                    bundle_name: "start/a".into(),
+                    cache_file_name: "a".into(),
+                    cache_directory_name: "d".into(),
+                    hash: "same".into(),
+                    category: AssetCategory::StartApp,
+                    crc: 123,
+                    file_size: 1,
+                    dependencies: Vec::new(),
+                    paths: Vec::new(),
+                    is_builtin: false,
+                    is_relocate: None,
+                    md5_hash: None,
+                    download_path: None,
+                },
+            )]),
+        };
+        let bytes = encrypt_asset_info(&info);
+        let app = Router::new().route(
+            "/info",
+            get(move || {
+                let bytes = bytes.clone();
+                async move { bytes }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut region = test_region(RegionProviderConfig::ColorfulPalette {
+            current_version_url: None,
+            game_version_url_template: None,
+            asset_info_url_template: format!("http://{addr}/info"),
+            asset_bundle_url_template: format!("http://{addr}/bundle/{{bundle_path}}"),
+            profile: "production".into(),
+            profile_hashes: BTreeMap::from([("production".into(), "abc".into())]),
+            required_cookies: false,
+            cookie_bootstrap_url: None,
+        });
+        region.paths.asset_save_dir =
+            Some(temp.path().join("exports").to_string_lossy().into_owned());
+        region.paths.downloaded_asset_record_file =
+            Some(record_file.to_string_lossy().into_owned());
+        let config = AppConfig {
+            regions: BTreeMap::from([("jp".into(), region.clone())]),
+            ..AppConfig::default()
+        };
+        let request = AssetUpdateRequest {
+            region: "jp".into(),
+            asset_version: Some("1".into()),
+            asset_hash: Some("hash".into()),
+            dry_run: false,
+            mode: AssetUpdateMode::Update,
+        };
+        let observed = Arc::new(AtomicUsize::new(usize::MAX));
+        let result = AssetExecutionContext::new(&config, "jp", &region, &request)
+            .unwrap()
+            .execute_with_filter(
+                &config,
+                None,
+                None,
+                Some(ObservePlanning {
+                    authoritative,
+                    observed: observed.clone(),
+                }),
+            )
+            .await;
+        server.abort();
+        assert!(matches!(
+            result,
+            Err(crate::core::errors::AssetExecutionError::Cancelled)
+        ));
+        assert_eq!(std::fs::read(&record_file).unwrap(), record);
+        observed.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn hip_planning_does_not_hide_previously_exported_bundle() {
+        assert_eq!(
+            observed_planning_tasks(true, br#"{"start/a":"same"}"#).await,
+            1
+        );
+        assert_eq!(
+            observed_planning_tasks(true, b"invalid legacy JSON").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_planning_still_honors_download_record() {
+        assert_eq!(
+            observed_planning_tasks(false, br#"{"start/a":"same"}"#).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn hip_export_completion_does_not_persist_download_record() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("downloaded_assets.json");
+        let original = br#"{"previous":"hash"}"#;
+        std::fs::write(&path, original).unwrap();
+        let mut memory_record = DownloadRecord::new();
+        let (mut completed, mut pending) = (0, 0);
+        AssetExecutionContext::record_completed_bundle(
+            &None,
+            path.to_str().unwrap(),
+            &mut memory_record,
+            &mut completed,
+            &mut pending,
+            1,
+            false,
+            "jp",
+            "uncommitted".into(),
+            "fingerprint".into(),
+        )
+        .await;
+        assert_eq!(completed, 1);
+        assert_eq!(pending, 0);
+        assert_eq!(memory_record.get("uncommitted").unwrap(), "fingerprint");
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
 
     fn test_region(provider: RegionProviderConfig) -> RegionConfig {
         RegionConfig {
