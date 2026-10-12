@@ -61,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls_ca_file: None,
         handshake_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(120),
+        commit_timeout: Duration::from_secs(300),
         max_frame_bytes: 16 * 1024 * 1024,
         chunk_size_bytes: chunk_size,
         heartbeat_interval: Duration::from_secs(30),

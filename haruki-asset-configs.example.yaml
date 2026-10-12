@@ -58,6 +58,7 @@ hip:
     ca_file: ""
   handshake_timeout_ms: 5000
   request_timeout_ms: 30000
+  commit_timeout_ms: 300000      # COMMIT writes the whole batch in one gateway transaction
   max_frame_bytes: 16777216
   chunk_size_bytes: 1048576
   max_in_flight_uploads: 8
@@ -73,6 +74,7 @@ hip:
   # legacy "one COMMIT at the end of the region" behaviour.
   commit_batch_bundles: 500
   commit_batch_bytes: 536870912   # 512 MiB
+  commit_batch_files: 2000        # gateway COMMIT cost grows with file count
 
 backends:
   media:

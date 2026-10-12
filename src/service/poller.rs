@@ -587,6 +587,7 @@ async fn execute_once_attempt(
             old_info.as_ref(),
             &processed_bundles,
         );
+        discard_download_record_after_failure(&ctx.config, &ctx.region_name).await;
         if let Err(upload_err) = uploader_result {
             warn!(
                 region = %ctx.region_name,
@@ -605,6 +606,7 @@ async fn execute_once_attempt(
             old_info.as_ref(),
             &processed_bundles,
         );
+        discard_download_record_after_failure(&ctx.config, &ctx.region_name).await;
         return Err(err);
     }
 
@@ -673,10 +675,6 @@ async fn run_uploader(
     check_skipped_bundles: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     cancel: CancellationToken,
 ) -> Result<HashSet<String>, PollError> {
-    // Copy of the effective thresholds (either > 0 means the trigger is on).
-    let batch_bundles_threshold = hip_config.commit_batch_bundles;
-    let batch_bytes_threshold = hip_config.commit_batch_bytes;
-
     let mut batch: Vec<BundleArtefacts> = Vec::new();
     let mut batch_bytes: u64 = 0;
     let mut processed_all: HashSet<String> = HashSet::new();
@@ -710,11 +708,8 @@ async fn run_uploader(
                         batch_bytes += bytes_this;
                         batch.push(art);
 
-                        let should_flush = (batch_bundles_threshold > 0
-                            && batch.len() >= batch_bundles_threshold)
-                            || (batch_bytes_threshold > 0
-                                && batch_bytes >= batch_bytes_threshold);
-                        if should_flush {
+                        let batch_files: usize = batch.iter().map(|b| b.files.len()).sum();
+                        if batch_reached_threshold(&hip_config, batch.len(), batch_bytes, batch_files) {
                             batch_index += 1;
                             flush_batch(
                                 &config,
@@ -785,6 +780,19 @@ async fn run_uploader(
     }
 
     Ok(processed_all)
+}
+
+/// Whether the pending batch should be committed now. Each threshold is off
+/// when set to 0; whichever enabled threshold is reached first fires.
+fn batch_reached_threshold(
+    hip_config: &crate::core::config::HipConfig,
+    bundles: usize,
+    bytes: u64,
+    files: usize,
+) -> bool {
+    (hip_config.commit_batch_bundles > 0 && bundles >= hip_config.commit_batch_bundles)
+        || (hip_config.commit_batch_bytes > 0 && bytes >= hip_config.commit_batch_bytes)
+        || (hip_config.commit_batch_files > 0 && files >= hip_config.commit_batch_files)
 }
 
 fn handle_uploader_result(
@@ -1072,6 +1080,7 @@ async fn connect_hip_with(
         tls_ca_file: hip_config.tls.ca_file.clone(),
         handshake_timeout: Duration::from_millis(hip_config.handshake_timeout_ms),
         request_timeout: Duration::from_millis(hip_config.request_timeout_ms),
+        commit_timeout: Duration::from_millis(hip_config.commit_timeout_ms),
         max_frame_bytes: hip_config.max_frame_bytes,
         chunk_size_bytes: hip_config.chunk_size_bytes,
         heartbeat_interval: Duration::from_secs(hip_config.heartbeat_interval_seconds.max(1)),
@@ -1185,6 +1194,7 @@ async fn connect_hip(
         tls_ca_file: hip_config.tls.ca_file.clone(),
         handshake_timeout: Duration::from_millis(hip_config.handshake_timeout_ms),
         request_timeout: Duration::from_millis(hip_config.request_timeout_ms),
+        commit_timeout: Duration::from_millis(hip_config.commit_timeout_ms),
         max_frame_bytes: hip_config.max_frame_bytes,
         chunk_size_bytes: hip_config.chunk_size_bytes,
         heartbeat_interval: Duration::from_secs(hip_config.heartbeat_interval_seconds.max(1)),
@@ -1477,6 +1487,42 @@ struct CleanupSummary {
 impl CleanupSummary {
     fn has_failures(&self) -> bool {
         self.failed_files > 0 || self.failed_dirs > 0
+    }
+}
+
+/// Drops the region's local download record after a failed HIP attempt.
+///
+/// The executor records a bundle as soon as it is exported, before the HIP
+/// COMMIT that makes it durable. Keeping that record across a failed attempt
+/// makes the retry skip bundles whose upload never landed, so the retry can
+/// "succeed" with them missing. The layer-1 snapshot and HIP CHECK already
+/// decide what still needs uploading, so dropping the record is safe.
+async fn discard_download_record_after_failure(config: &AppConfig, region_name: &str) {
+    if !config.hip.enabled {
+        return;
+    }
+    let Some(record_file) = config
+        .regions
+        .get(region_name)
+        .and_then(|region| region.paths.downloaded_asset_record_file.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    match tokio::fs::remove_file(record_file).await {
+        Ok(()) => info!(
+            region = %region_name,
+            path = %record_file,
+            "discarded local download record after failed attempt",
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => warn!(
+            region = %region_name,
+            path = %record_file,
+            error = %err,
+            "failed to discard local download record after failed attempt",
+        ),
     }
 }
 
@@ -1969,6 +2015,58 @@ mod tests {
 
         assert!(matches!(result, Err(PollError::Hip(message)) if message == "already present"));
         assert!(processed.is_empty());
+    }
+
+    #[test]
+    fn batch_threshold_fires_on_file_count() {
+        let hip = crate::core::config::HipConfig {
+            commit_batch_bundles: 120,
+            commit_batch_bytes: 256 * 1024 * 1024,
+            commit_batch_files: 2_000,
+            ..crate::core::config::HipConfig::default()
+        };
+        assert!(!batch_reached_threshold(&hip, 23, 1024, 1_999));
+        assert!(batch_reached_threshold(&hip, 23, 1024, 2_000));
+        assert!(batch_reached_threshold(&hip, 120, 1024, 1));
+
+        let files_off = crate::core::config::HipConfig {
+            commit_batch_files: 0,
+            ..hip
+        };
+        assert!(!batch_reached_threshold(&files_off, 23, 1024, 50_000));
+    }
+
+    fn config_with_record(record_file: &Path, hip_enabled: bool) -> AppConfig {
+        let mut region = RegionConfig::default();
+        region.paths.downloaded_asset_record_file =
+            Some(record_file.to_string_lossy().into_owned());
+        let mut config = AppConfig::default();
+        config.hip.enabled = hip_enabled;
+        config.regions.insert("jp".to_string(), region);
+        config
+    }
+
+    #[tokio::test]
+    async fn failed_hip_attempt_discards_download_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let record = temp.path().join("downloaded_assets.json");
+        fs::write(&record, r#"{"bundle/a":"crc"}"#).unwrap();
+
+        discard_download_record_after_failure(&config_with_record(&record, true), "jp").await;
+        assert!(!record.exists());
+
+        // Missing record is fine (e.g. nothing was exported before failing).
+        discard_download_record_after_failure(&config_with_record(&record, true), "jp").await;
+    }
+
+    #[tokio::test]
+    async fn download_record_is_kept_without_hip() {
+        let temp = tempfile::tempdir().unwrap();
+        let record = temp.path().join("downloaded_assets.json");
+        fs::write(&record, "{}").unwrap();
+
+        discard_download_record_after_failure(&config_with_record(&record, false), "jp").await;
+        assert!(record.exists());
     }
 
     #[test]

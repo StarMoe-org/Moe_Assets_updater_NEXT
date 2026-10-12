@@ -90,6 +90,10 @@ pub struct HipConfig {
     pub tls: HipTlsConfig,
     pub handshake_timeout_ms: u64,
     pub request_timeout_ms: u64,
+    /// Timeout for the COMMIT reply. The gateway writes every asset row of
+    /// the batch in one transaction, so a COMMIT can legitimately take far
+    /// longer than CHECK / UPLOAD round-trips.
+    pub commit_timeout_ms: u64,
     pub max_frame_bytes: u64,
     pub chunk_size_bytes: usize,
     pub max_in_flight_uploads: u32,
@@ -107,6 +111,9 @@ pub struct HipConfig {
     /// Sibling of `commit_batch_bundles`. Whichever threshold fires first
     /// triggers the commit. `0` disables the byte-based trigger.
     pub commit_batch_bytes: u64,
+    /// Sibling of `commit_batch_bundles` counting exported files, which is
+    /// what drives gateway COMMIT cost. `0` disables the file-based trigger.
+    pub commit_batch_files: usize,
 }
 
 impl Default for HipConfig {
@@ -118,6 +125,7 @@ impl Default for HipConfig {
             tls: HipTlsConfig::default(),
             handshake_timeout_ms: 5_000,
             request_timeout_ms: 30_000,
+            commit_timeout_ms: 300_000,
             max_frame_bytes: 16 * 1024 * 1024,
             chunk_size_bytes: 1024 * 1024,
             max_in_flight_uploads: 8,
@@ -125,6 +133,7 @@ impl Default for HipConfig {
             heartbeat_interval_seconds: 30,
             commit_batch_bundles: 500,
             commit_batch_bytes: 512 * 1024 * 1024,
+            commit_batch_files: 2_000,
         }
     }
 }
