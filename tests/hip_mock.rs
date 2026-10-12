@@ -213,6 +213,7 @@ fn client_config(endpoint: String) -> HipClientConfig {
         tls_ca_file: None,
         handshake_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(5),
+        commit_timeout: Duration::from_secs(5),
         max_frame_bytes: MAX_FRAME,
         chunk_size_bytes: 32 * 1024,
         heartbeat_interval: Duration::from_secs(60),

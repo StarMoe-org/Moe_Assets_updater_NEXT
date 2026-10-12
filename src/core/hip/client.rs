@@ -55,6 +55,7 @@ pub struct HipClientConfig {
     pub tls_ca_file: Option<String>,
     pub handshake_timeout: Duration,
     pub request_timeout: Duration,
+    pub commit_timeout: Duration,
     pub max_frame_bytes: u64,
     pub chunk_size_bytes: usize,
     pub heartbeat_interval: Duration,
@@ -70,6 +71,7 @@ impl Default for HipClientConfig {
             tls_ca_file: None,
             handshake_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
+            commit_timeout: Duration::from_secs(300),
             max_frame_bytes: MAX_DEFAULT_FRAME_BYTES,
             chunk_size_bytes: 1024 * 1024,
             heartbeat_interval: Duration::from_secs(30),
@@ -325,9 +327,9 @@ impl HipSession {
         })?;
         self.inner.send_frame(FrameType::Commit, payload).await?;
 
-        let ack = timeout(self.inner.config.request_timeout, rx)
+        let ack = timeout(self.inner.config.commit_timeout, rx)
             .await
-            .map_err(|_| HipError::Timeout(self.inner.config.request_timeout.as_millis() as u64))?
+            .map_err(|_| HipError::Timeout(self.inner.config.commit_timeout.as_millis() as u64))?
             .map_err(|_| HipError::SessionClosed("commit reply dropped".into()))?;
         Ok(ack)
     }
