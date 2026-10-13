@@ -345,6 +345,8 @@ async fn execute_once_attempt(
     current: &CurrentVersionInfo,
     request: &AssetUpdateRequest,
 ) -> Result<RunOutcome, PollError> {
+    clear_region_work_dir_before_attempt(&ctx.config, &ctx.region_name).await?;
+
     // Layer 1: fetch full AssetBundleInfo, diff against the previous
     // committed snapshot. `changed` = bundles that are either new or whose
     // fingerprint has changed. Only these need to be considered further.
@@ -1530,14 +1532,48 @@ async fn remove_region_work_dir_after_success(
     config: &AppConfig,
     region_name: &str,
 ) -> Result<(), PollError> {
+    if let Some(path) = remove_region_work_dir(config, region_name, "after HIP success").await? {
+        info!(
+            region = %region_name,
+            path = %path.display(),
+            "removed region local work dir after HIP success",
+        );
+    }
+    Ok(())
+}
+
+/// Exports left on disk by an earlier failed attempt make the exporter treat
+/// every re-exported file as a name collision and write it as `__dupN`, so the
+/// retry publishes the bundle under the wrong paths. With
+/// `remove_local_after_upload` nothing in the work dir is meant to outlive an
+/// attempt, so each attempt starts from an empty dir.
+async fn clear_region_work_dir_before_attempt(
+    config: &AppConfig,
+    region_name: &str,
+) -> Result<(), PollError> {
+    if let Some(path) = remove_region_work_dir(config, region_name, "before HIP attempt").await? {
+        warn!(
+            region = %region_name,
+            path = %path.display(),
+            "removed stale region local work dir left by an earlier attempt",
+        );
+    }
+    Ok(())
+}
+
+async fn remove_region_work_dir(
+    config: &AppConfig,
+    region_name: &str,
+    stage: &str,
+) -> Result<Option<std::path::PathBuf>, PollError> {
     if !config.hip.enabled {
-        return Ok(());
+        return Ok(None);
     }
     let Some(region_config) = config.regions.get(region_name) else {
-        return Ok(());
+        return Ok(None);
     };
     if !region_config.upload.remove_local_after_upload {
-        return Ok(());
+        return Ok(None);
     }
     let Some(asset_save_dir) = region_config
         .paths
@@ -1546,27 +1582,22 @@ async fn remove_region_work_dir_after_success(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return Ok(());
+        return Ok(None);
     };
 
     let Some(cleanup_dir) = resolve_region_cleanup_dir(region_name, Path::new(asset_save_dir))?
     else {
-        return Ok(());
+        return Ok(None);
     };
     tokio::fs::remove_dir_all(&cleanup_dir)
         .await
         .map_err(|err| {
             PollError::Execution(format!(
-                "remove region local work dir {} after HIP success: {err}",
+                "remove region local work dir {} {stage}: {err}",
                 cleanup_dir.display()
             ))
         })?;
-    info!(
-        region = %region_name,
-        path = %cleanup_dir.display(),
-        "removed region local work dir after HIP success",
-    );
-    Ok(())
+    Ok(Some(cleanup_dir))
 }
 
 fn resolve_region_cleanup_dir(
@@ -2079,6 +2110,47 @@ mod tests {
         assert!(result.is_ok());
         assert!(processed.contains("skipped"));
         assert!(processed.contains("uploaded"));
+    }
+
+    fn config_with_work_dir(work_dir: &Path, remove_local_after_upload: bool) -> AppConfig {
+        let mut region = RegionConfig::default();
+        region.paths.asset_save_dir = Some(work_dir.to_string_lossy().into_owned());
+        region.upload.remove_local_after_upload = remove_local_after_upload;
+        let mut config = AppConfig::default();
+        config.hip.enabled = true;
+        config.regions.insert("jp".to_string(), region);
+        config
+    }
+
+    #[tokio::test]
+    async fn hip_attempt_starts_without_stale_exports() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = temp.path().join("jp-assets");
+        let stale = work_dir.join("AssetBundles/thumbnail/chara/res003_no056_normal.webp");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, b"stale").unwrap();
+
+        clear_region_work_dir_before_attempt(&config_with_work_dir(&work_dir, true), "jp")
+            .await
+            .unwrap();
+        assert!(!work_dir.exists());
+
+        // Already clean is fine.
+        clear_region_work_dir_before_attempt(&config_with_work_dir(&work_dir, true), "jp")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn work_dir_is_kept_when_local_exports_are_retained() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = temp.path().join("jp-assets");
+        fs::create_dir_all(&work_dir).unwrap();
+
+        clear_region_work_dir_before_attempt(&config_with_work_dir(&work_dir, false), "jp")
+            .await
+            .unwrap();
+        assert!(work_dir.exists());
     }
 
     #[test]
