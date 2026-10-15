@@ -6,10 +6,11 @@
 //! this entirely — dedup is now server-authoritative via `CHECK_BATCH`, and
 //! Layer 1 uses `bundle_diff` msgpack snapshots instead of this JSON map.
 //!
-//! The module is kept alive only because `AssetExecutionContext::execute`
-//! (still the workhorse for one region's actual download/decrypt/export
-//! pass) reads and writes the record inline. It is essentially a scratch
-//! file at this point; the poller does not consult it for scheduling.
+//! Legacy/non-authoritative executions still read and write this record.
+//! With a server-authoritative HIP filter, the executor neither uses the
+//! persisted record to hide candidates nor writes new export results into it.
+//! Its in-memory map can still feed chart-hash sync; durable HIP completion is
+//! tracked separately by acknowledged snapshots and verified watermarks.
 
 use std::collections::BTreeMap;
 use std::path::Path;
