@@ -1466,15 +1466,41 @@ impl AssetExecutionContext {
                 ..
             } => {
                 // For nuverse, always fetch the CDN asset version from asset_version_url.
-                let app_version = self.resolved_app_version.as_deref().unwrap_or(app_version);
-                let version_url = asset_version_url.replace("{app_version}", app_version);
-                let resolved_version =
-                    String::from_utf8_lossy(&self.get_with_retry(&version_url).await?)
-                        .trim()
-                        .to_string();
+                let mut app_version = self
+                    .resolved_app_version
+                    .clone()
+                    .unwrap_or_else(|| app_version.clone());
+                let version_url = asset_version_url.replace("{app_version}", &app_version);
+                let body = match self.get_with_retry(&version_url).await {
+                    Ok(body) => body,
+                    Err(err) => {
+                        // Patch releases (e.g. 6.4.1) usually ship no CDN tree
+                        // of their own and keep serving assets from `x.y.0`.
+                        let base = match (&err, nuverse_cdn_base_version(&app_version)) {
+                            (AssetExecutionError::HttpStatus { status: 404, .. }, Some(base)) => {
+                                base
+                            }
+                            _ => return Err(err),
+                        };
+                        tracing::info!(
+                            region = %self.region_name,
+                            app_version = %app_version,
+                            cdn_app_version = %base,
+                            "nuverse CDN has no tree for this patch version; falling back to minor base"
+                        );
+                        let body = self
+                            .get_with_retry(&asset_version_url.replace("{app_version}", &base))
+                            .await?;
+                        app_version = base;
+                        body
+                    }
+                };
+                let resolved_version = String::from_utf8_lossy(&body).trim().to_string();
+                // Bundle URLs reuse this, so they follow the same CDN tree.
+                self.resolved_app_version = Some(app_version.clone());
                 self.resolved_asset_version = Some(resolved_version.clone());
                 Ok(asset_info_url_template
-                    .replace("{app_version}", app_version)
+                    .replace("{app_version}", &app_version)
                     .replace("{asset_version}", &resolved_version)
                     + &time_arg_jst())
             }
@@ -2232,6 +2258,24 @@ pub async fn fetch_live_asset_bundle_info(
     context.fetch_asset_bundle_info().await
 }
 
+/// Map a Nuverse patch version (`6.4.1`) to the `major.minor.0` CDN tree it
+/// is served from. Returns `None` for `.0` releases and non-`x.y.z` input,
+/// where there is nothing to fall back to.
+fn nuverse_cdn_base_version(app_version: &str) -> Option<String> {
+    let parts: Vec<&str> = app_version.split('.').collect();
+    let [major, minor, patch] = parts.as_slice() else {
+        return None;
+    };
+    let is_number = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    if !(is_number(major) && is_number(minor) && is_number(patch)) {
+        return None;
+    }
+    if patch.bytes().all(|b| b == b'0') {
+        return None;
+    }
+    Some(format!("{major}.{minor}.0"))
+}
+
 fn is_retryable_http_error(err: &AssetExecutionError) -> bool {
     match err {
         AssetExecutionError::Http(_) => true,
@@ -2403,9 +2447,10 @@ mod tests {
     use crate::core::models::{AssetUpdateMode, AssetUpdateRequest};
 
     use super::{
-        decrypt_asset_bundle_info, deobfuscate, post_process_backlog_capacity,
-        raw_bundle_output_path, should_download_bundle, AssetBundleDetail, AssetBundleInfo,
-        AssetCategory, AssetExecutionContext,
+        decrypt_asset_bundle_info, deobfuscate, fetch_live_asset_bundle_info,
+        nuverse_cdn_base_version, post_process_backlog_capacity, raw_bundle_output_path,
+        should_download_bundle, AssetBundleDetail, AssetBundleInfo, AssetCategory,
+        AssetExecutionContext,
     };
 
     type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
@@ -3180,6 +3225,251 @@ mod tests {
         assert_eq!(summary.discovered_bundles, 1);
         assert_eq!(summary.completed_downloads, 1);
         assert_eq!(stale_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn nuverse_cdn_base_version_maps_patch_releases_only() {
+        assert_eq!(nuverse_cdn_base_version("6.4.1").as_deref(), Some("6.4.0"));
+        assert_eq!(
+            nuverse_cdn_base_version("10.12.3").as_deref(),
+            Some("10.12.0")
+        );
+        assert_eq!(nuverse_cdn_base_version("6.4.0"), None);
+        assert_eq!(nuverse_cdn_base_version("6.4"), None);
+        assert_eq!(nuverse_cdn_base_version("6.4.1.0"), None);
+        assert_eq!(nuverse_cdn_base_version("6.4.x"), None);
+        assert_eq!(nuverse_cdn_base_version(""), None);
+    }
+
+    #[tokio::test]
+    async fn nuverse_patch_app_version_falls_back_to_minor_base_tree() {
+        let temp = tempdir().unwrap();
+        let record_file = temp.path().join("downloaded_assets.json");
+        let save_dir = temp.path().join("exports");
+
+        let info = AssetBundleInfo {
+            version: Some("1".to_string()),
+            os: Some("ios".to_string()),
+            bundles: HashMap::from([(
+                "ond/a".to_string(),
+                AssetBundleDetail {
+                    bundle_name: "ond/a".to_string(),
+                    cache_file_name: "a".to_string(),
+                    cache_directory_name: "d".to_string(),
+                    hash: "hash-a".to_string(),
+                    category: AssetCategory::OnDemand,
+                    crc: 888,
+                    file_size: 1,
+                    dependencies: Vec::new(),
+                    paths: Vec::new(),
+                    is_builtin: false,
+                    is_relocate: None,
+                    md5_hash: None,
+                    download_path: Some("ios15".to_string()),
+                },
+            )]),
+        };
+        let encrypted = encrypt_asset_info(&info);
+        let missing_hits = Arc::new(AtomicUsize::new(0));
+
+        // current_version.json reports the 6.4.1 patch release, but the CDN
+        // only has the 6.4.0 tree. Only the first 6.4.1 version probe may 404;
+        // asset info and bundle downloads must both use 6.4.0.
+        let app = Router::new()
+            .route(
+                "/current_version.json",
+                get(|| async { r#"{"appVersion":"6.4.1","assetVersion":"6.4.1.0"}"# }),
+            )
+            .route("/version/6.4.0", get(|| async { "15" }))
+            .route(
+                "/info/6.4.0/15",
+                get({
+                    let encrypted = encrypted.clone();
+                    move || async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            encrypted.clone(),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/bundle/6.4.0/ios15/ond/a",
+                get(|| async {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                        Body::from(vec![0x20, 0x00, 0x00, 0x00, b'B', b'U', b'N']),
+                    )
+                }),
+            )
+            .fallback({
+                let missing_hits = missing_hits.clone();
+                move || {
+                    let missing_hits = missing_hits.clone();
+                    async move {
+                        missing_hits.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::NOT_FOUND
+                    }
+                }
+            });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let region = RegionConfig {
+            enabled: true,
+            provider: RegionProviderConfig::Nuverse {
+                current_version_url: Some(format!("http://{addr}/current_version.json")),
+                asset_version_url: format!("http://{addr}/version/{{app_version}}"),
+                app_version: "6.0.0".to_string(),
+                asset_info_url_template: format!(
+                    "http://{addr}/info/{{app_version}}/{{asset_version}}"
+                ),
+                asset_bundle_url_template: format!(
+                    "http://{addr}/bundle/{{app_version}}/{{bundle_path}}"
+                ),
+                required_cookies: false,
+                cookie_bootstrap_url: None,
+            },
+            crypto: crate::core::config::CryptoConfig {
+                aes_key_hex: Some(TEST_AES_KEY_HEX.to_string()),
+                aes_iv_hex: Some(TEST_AES_IV_HEX.to_string()),
+            },
+            runtime: RegionRuntimeConfig {
+                unity_version: "2022.3.21f1".to_string(),
+            },
+            paths: RegionPathsConfig {
+                asset_save_dir: Some(save_dir.to_string_lossy().into_owned()),
+                downloaded_asset_record_file: Some(record_file.to_string_lossy().into_owned()),
+            },
+            filters: crate::core::config::RegionFiltersConfig {
+                start_app: Vec::new(),
+                on_demand: vec!["^ond/".to_string()],
+                skip: Vec::new(),
+                priority: vec!["^ond/".to_string()],
+            },
+            export: crate::core::config::RegionExportConfig {
+                raw_bundles: Some(RawBundleExportConfig {
+                    output_dir: None,
+                    include: vec!["^ond/".to_string()],
+                    exclude: Vec::new(),
+                }),
+                ..crate::core::config::RegionExportConfig::default()
+            },
+            ..RegionConfig::default()
+        };
+
+        let mut regions = BTreeMap::new();
+        regions.insert("cn".to_string(), region.clone());
+        let config = AppConfig {
+            regions,
+            concurrency: crate::core::config::ConcurrencyConfig {
+                download: 2,
+                ..crate::core::config::ConcurrencyConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let request = AssetUpdateRequest {
+            region: "cn".to_string(),
+            asset_version: None,
+            asset_hash: None,
+            dry_run: false,
+            mode: AssetUpdateMode::PrefetchRawBundles,
+        };
+
+        let executor = AssetExecutionContext::new(&config, "cn", &region, &request).unwrap();
+        let summary = executor
+            .prefetch_asset_bundles(&config, None, None)
+            .await
+            .unwrap();
+        assert_eq!(summary.discovered_bundles, 1);
+        assert_eq!(summary.completed_downloads, 1);
+        assert_eq!(missing_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn nuverse_patch_app_version_uses_own_tree_when_present() {
+        let info = AssetBundleInfo {
+            version: Some("1".to_string()),
+            os: Some("ios".to_string()),
+            bundles: HashMap::new(),
+        };
+        let encrypted = encrypt_asset_info(&info);
+        let base_hits = Arc::new(AtomicUsize::new(0));
+
+        let app = Router::new()
+            .route(
+                "/current_version.json",
+                get(|| async { r#"{"appVersion":"6.4.1","assetVersion":"6.4.1.0"}"# }),
+            )
+            .route("/version/6.4.1", get(|| async { "16" }))
+            .route(
+                "/info/6.4.1/16",
+                get(move || {
+                    let encrypted = encrypted.clone();
+                    async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                            encrypted,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/version/6.4.0",
+                get({
+                    let base_hits = base_hits.clone();
+                    move || {
+                        let base_hits = base_hits.clone();
+                        async move {
+                            base_hits.fetch_add(1, Ordering::SeqCst);
+                            "15"
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let region = test_region(RegionProviderConfig::Nuverse {
+            current_version_url: Some(format!("http://{addr}/current_version.json")),
+            asset_version_url: format!("http://{addr}/version/{{app_version}}"),
+            app_version: "6.0.0".to_string(),
+            asset_info_url_template: format!(
+                "http://{addr}/info/{{app_version}}/{{asset_version}}"
+            ),
+            asset_bundle_url_template: format!(
+                "http://{addr}/bundle/{{app_version}}/{{bundle_path}}"
+            ),
+            required_cookies: false,
+            cookie_bootstrap_url: None,
+        });
+        let mut regions = BTreeMap::new();
+        regions.insert("cn".to_string(), region.clone());
+        let config = AppConfig {
+            regions,
+            ..AppConfig::default()
+        };
+        let request = AssetUpdateRequest {
+            region: "cn".to_string(),
+            asset_version: None,
+            asset_hash: None,
+            dry_run: false,
+            mode: AssetUpdateMode::Update,
+        };
+
+        let fetched = fetch_live_asset_bundle_info(&config, "cn", &region, &request)
+            .await
+            .unwrap();
+        assert_eq!(fetched.version.as_deref(), Some("1"));
+        assert_eq!(base_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
