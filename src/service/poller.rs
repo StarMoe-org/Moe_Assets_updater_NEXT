@@ -24,7 +24,7 @@ use crate::core::config::{AppConfig, RegionConfig};
 use crate::core::hip::{
     CheckAction, CheckBatchItem, CommitBundleCompletion, CommitStats, HelloParams, HipClient,
 };
-use crate::core::models::{AssetUpdateMode, AssetUpdateRequest};
+use crate::core::models::{AssetUpdateMode, AssetUpdateRequest, ExecutionSummary};
 use crate::core::regions::select_region;
 use crate::service::watermark::{RegionWatermark, WatermarkStore};
 
@@ -277,10 +277,11 @@ async fn execute_once(ctx: &RegionLoopCtx) -> Result<RunOutcome, PollError> {
     };
 
     if let Some(watermark) = ctx.watermarks.get(&ctx.region_name).await {
-        if !watermark.asset_version.is_empty()
-            && watermark.asset_version == current.asset_version_or_default()
-            && watermark.asset_hash == current.asset_hash_or_default()
-        {
+        if watermark.can_skip(
+            &current.asset_version_or_default(),
+            &current.asset_hash_or_default(),
+            ctx.config.hip.enabled,
+        ) {
             remove_region_work_dir_after_success(&ctx.config, &ctx.region_name).await?;
             return Ok(RunOutcome::SkippedByWatermark);
         }
@@ -402,9 +403,11 @@ async fn execute_once_attempt(
     let layer1_skipped_before_check = diff.stats.unchanged;
 
     let check_skipped_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let expected_bundles = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
     let check_skipped_bundles: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let filter = CombinedFilter {
+        expected_bundles: expected_bundles.clone(),
         layer1_allow: Arc::new(changed_names),
         layer1_skipped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         hip: check_session.as_ref().map(|session| HipCheckFilter {
@@ -636,6 +639,14 @@ async fn execute_once_attempt(
         &processed_bundles,
     );
 
+    let expected = expected_bundles.lock().await;
+    validate_poll_completion(
+        &summary,
+        ctx.config.hip.enabled.then_some(&*expected),
+        &processed_bundles,
+    )?;
+    drop(expected);
+
     remove_region_work_dir_after_success(&ctx.config, &ctx.region_name).await?;
 
     let wm = RegionWatermark {
@@ -644,6 +655,7 @@ async fn execute_once_attempt(
         app_version: current.app_version_or_default(),
         bundle_count: summary.discovered_bundles as u64,
         committed_at: Utc::now(),
+        hip_verified: ctx.config.hip.enabled,
     };
     ctx.watermarks
         .set(&ctx.region_name, wm)
@@ -1345,12 +1357,17 @@ impl ProgressReporter {
 }
 
 struct CombinedFilter {
+    expected_bundles: Arc<tokio::sync::Mutex<HashSet<String>>>,
     layer1_allow: Arc<HashSet<String>>,
     layer1_skipped: Arc<std::sync::atomic::AtomicU64>,
     hip: Option<HipCheckFilter>,
 }
 
 impl PreDownloadTaskFilter for CombinedFilter {
+    fn is_server_authoritative(&self) -> bool {
+        self.hip.is_some()
+    }
+
     fn filter(
         self,
         tasks: Vec<DownloadTask>,
@@ -1369,6 +1386,8 @@ impl PreDownloadTaskFilter for CombinedFilter {
             // partial local snapshot cannot hide missing gateway bundles until
             // the container is restarted.
             if let Some(hip) = self.hip {
+                *self.expected_bundles.lock().await =
+                    tasks.iter().map(|task| task.bundle_path.clone()).collect();
                 self.layer1_skipped
                     .store(0, std::sync::atomic::Ordering::Relaxed);
                 return hip.filter(tasks).await;
@@ -1405,6 +1424,10 @@ struct HipCheckFilter {
 }
 
 impl PreDownloadTaskFilter for HipCheckFilter {
+    fn is_server_authoritative(&self) -> bool {
+        true
+    }
+
     fn filter(
         self,
         tasks: Vec<DownloadTask>,
@@ -1947,10 +1970,95 @@ enum PollError {
     Hip(String),
 }
 
+fn validate_poll_completion(
+    summary: &ExecutionSummary,
+    expected: Option<&HashSet<String>>,
+    confirmed: &HashSet<String>,
+) -> Result<(), PollError> {
+    if summary.failed_downloads > 0 || summary.completed_downloads != summary.queued_downloads {
+        return Err(PollError::Execution(format!(
+            "incomplete execution: queued={}, completed={}, failed={}",
+            summary.queued_downloads, summary.completed_downloads, summary.failed_downloads,
+        )));
+    }
+    if let Some(expected) = expected {
+        let missing = expected.difference(confirmed).count();
+        if missing > 0 {
+            return Err(PollError::Hip(format!(
+                "{missing} candidate bundle(s) lack HIP completion confirmation; watermark unchanged",
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    fn completion_summary(queued: usize, completed: usize, failed: usize) -> ExecutionSummary {
+        ExecutionSummary {
+            discovered_bundles: queued,
+            queued_downloads: queued,
+            completed_downloads: completed,
+            failed_downloads: failed,
+            updated_record_entries: 0,
+            chart_hash_sync_performed: false,
+        }
+    }
+
+    #[test]
+    fn empty_queue_does_not_confirm_missing_gateway_bundles() {
+        let expected = HashSet::from(["missing".to_string()]);
+        assert!(validate_poll_completion(
+            &completion_summary(0, 0, 0),
+            Some(&expected),
+            &HashSet::new()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn partial_export_cannot_complete_region_without_hip() {
+        assert!(
+            validate_poll_completion(&completion_summary(3, 2, 1), None, &HashSet::new()).is_err()
+        );
+        assert!(
+            validate_poll_completion(&completion_summary(3, 2, 0), None, &HashSet::new()).is_err()
+        );
+    }
+
+    #[test]
+    fn uploaded_and_check_skipped_bundles_both_require_confirmation() {
+        let expected = HashSet::from(["uploaded".to_string(), "skipped".to_string()]);
+        let incomplete = HashSet::from(["uploaded".to_string(), "unrelated".to_string()]);
+        assert!(validate_poll_completion(
+            &completion_summary(1, 1, 0),
+            Some(&expected),
+            &incomplete
+        )
+        .is_err());
+        assert!(
+            validate_poll_completion(&completion_summary(1, 1, 0), Some(&expected), &expected)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn all_confirmed_skips_and_genuinely_empty_plan_can_complete() {
+        let expected = HashSet::from(["already-committed".to_string()]);
+        assert!(
+            validate_poll_completion(&completion_summary(0, 0, 0), Some(&expected), &expected)
+                .is_ok()
+        );
+        assert!(validate_poll_completion(
+            &completion_summary(0, 0, 0),
+            Some(&HashSet::new()),
+            &HashSet::new()
+        )
+        .is_ok());
+    }
 
     #[test]
     fn prune_empty_parent_dirs_stops_at_export_root() {

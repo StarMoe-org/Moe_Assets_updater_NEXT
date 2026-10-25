@@ -20,6 +20,19 @@ pub struct RegionWatermark {
     pub app_version: String,
     pub bundle_count: u64,
     pub committed_at: DateTime<Utc>,
+    /// Old watermarks may have been advanced after exports that never reached
+    /// HIP. They must pass the new completion checks before skipping a poll.
+    #[serde(default)]
+    pub hip_verified: bool,
+}
+
+impl RegionWatermark {
+    pub fn can_skip(&self, asset_version: &str, asset_hash: &str, hip_enabled: bool) -> bool {
+        !self.asset_version.is_empty()
+            && self.asset_version == asset_version
+            && self.asset_hash == asset_hash
+            && (!hip_enabled || self.hip_verified)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -95,6 +108,30 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    #[test]
+    fn legacy_watermark_requires_hip_reconciliation() {
+        let wm: RegionWatermark = sonic_rs::from_str(
+            r#"{"asset_version":"v","asset_hash":"hash","app_version":"app","bundle_count":3,"committed_at":"2026-10-13T00:00:00Z"}"#,
+        ).unwrap();
+        assert!(!wm.hip_verified);
+        assert!(!wm.can_skip("v", "hash", true));
+        assert!(wm.can_skip("v", "hash", false));
+    }
+
+    #[test]
+    fn verified_watermark_only_skips_its_version() {
+        let wm = RegionWatermark {
+            asset_version: "v".into(),
+            asset_hash: "hash".into(),
+            hip_verified: true,
+            ..RegionWatermark::default()
+        };
+        assert!(wm.can_skip("v", "hash", true));
+        assert!(!wm.can_skip("new", "hash", true));
+        assert!(!wm.can_skip("v", "changed", true));
+        assert!(!RegionWatermark::default().can_skip("", "", false));
+    }
+
     #[tokio::test]
     async fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -108,11 +145,13 @@ mod tests {
             app_version: "6.6.0".into(),
             bundle_count: 100,
             committed_at: Utc.timestamp_opt(1_700_000_000, 0).single().unwrap(),
+            hip_verified: true,
         };
         store.set("jp", wm.clone()).await.unwrap();
 
         let reopened = WatermarkStore::open(&path).await.unwrap();
         let got = reopened.get("jp").await.unwrap();
         assert_eq!(got.asset_version, "6.6.0.20");
+        assert!(got.hip_verified);
     }
 }
